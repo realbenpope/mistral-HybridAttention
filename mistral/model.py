@@ -115,6 +115,54 @@ class Attention(nn.Module):
 
         return self.wo(output.view(seqlen_sum, self.n_heads * self.head_dim))
 
+# Experimental 
+class MistralBidirectionalAttention(Attention):
+    def __init__(self, args: ModelArgs):
+        super().__init__(args)
+
+    def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]):
+
+        # Keep initial calculations the same
+        seqlen_sum, _ = x.shape    
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
+        xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
+        xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        # Bidirectional Attention Modification
+        key, val = xk.clone(), xv.clone() # Start with copies for full attention range
+
+        if cache is None:
+            # No cache - full bidirectional attention
+            pass  
+
+        else:
+            # Limit backward attention based on cache
+            key = key[:-cache.sliding_window:]
+            val = val[:-cache.sliding_window:]
+
+        # Repeat keys and values to match number of query heads
+        key, val = repeat_kv(key, val, self.repeats, dim=1)
+
+        # Bidirectional Calculation: We'll need two passes!
+        xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
+
+        # 1. Forward Attention
+        forward_output = memory_efficient_attention(xq, key, val, None if cache is None else cache.mask)
+
+        # 2. Backward Attention (reverse the sequences)
+        reversed_xq = torch.flip(xq, dims=[1])  # Reverse query sequence
+        reversed_key = torch.flip(key, dims=[1])  # Reverse key sequence
+        reversed_val = torch.flip(val, dims=[1])  # Reverse value sequence
+        backward_output = memory_efficient_attention(reversed_xq, reversed_key, reversed_val, None)
+
+        # Combine forward and backward outputs (simple average for now)
+        combined_output = (forward_output + torch.flip(backward_output, dims=[1])) / 2 
+
+        return self.wo(combined_output.view(seqlen_sum, self.n_heads * self.head_dim))
+
+
 
 class FeedForward(nn.Module):
     def __init__(self, args: ModelArgs):
