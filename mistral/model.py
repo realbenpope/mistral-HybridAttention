@@ -117,12 +117,13 @@ class Attention(nn.Module):
 
 # Experimental 
 class MistralBidirectionalAttention(Attention):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, bidirectional_mode="cache_limited"):
         super().__init__(args)
+        self.bidirectional_mode = bidirectional_mode  # Options: "cache_limited", "full"
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor, cache: Optional[CacheView]):
 
-        # Keep initial calculations the same
+       # Keep initial calculations the same
         seqlen_sum, _ = x.shape    
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
@@ -132,34 +133,34 @@ class MistralBidirectionalAttention(Attention):
 
         # Bidirectional Attention Modification
         key, val = xk.clone(), xv.clone() # Start with copies for full attention range
-
         if cache is None:
-            # Full bidirectional attention (likely during training)
+            # Thought Processing Mode (Full Bidirectional)
             forward_output = memory_efficient_attention(xq, key, val, None) 
             backward_output = memory_efficient_attention(reversed_xq, reversed_key, reversed_val, None)
 
         else:
-            # Adjust attention based on cache state
-            if cache.prefill:
-                # Use BlockDiagonalMask for bidirectional attention within the cache
+            # Mode depends on the self.bidirectional_mode setting 
+            if self.bidirectional_mode == "cache_limited":
+                # Limited Bidirectional within Cache, followed by Causal   
                 mask = BlockDiagonalMask.from_seqlens(q_seqlen=x.shape[0], kv_seqlen=cache.key.shape[0])
-            else:
-                # Limit backward attention appropriately (similarly, forward might be adjusted)
-                mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
-                    q_seqlen=x.shape[0],
-                    kv_padding=cache.sliding_window,
-                    kv_seqlen=cache.key.shape[0]
-                )
+                bidirectional_output = memory_efficient_attention(xq, key, val, mask)
 
-            # Apply bidirectional attention with the adjusted mask(s)
-            forward_output = memory_efficient_attention(xq, key, val, mask) 
-            backward_output = memory_efficient_attention(reversed_xq, reversed_key, reversed_val, mask) 
+                # Language Processing Mode (Causal)
+                causal_mask = ...  # Construct appropriate Mistral causal mask 
+                language_output = memory_efficient_attention(xq, key, val, causal_mask) 
 
-        # Combine forward and backward outputs (simple average for now)
-        combined_output = (forward_output + torch.flip(backward_output, dims=[1])) / 2 
+            elif self.bidirectional_mode == "full":
+                # Concept Processing Mode (Full Bidirectional)
+                mask = BlockDiagonalMask.from_seqlens(q_seqlen=x.shape[0], kv_seqlen=cache.key.shape[0])
+                bidirectional_output = memory_efficient_attention(xq, key, val, mask) 
 
-        return self.wo(combined_output.view(seqlen_sum, self.n_heads * self.head_dim))
+                # Note: No explicit language processing here, output is conceptual
 
+                # Combine forward and backward outputs (simple average for now)
+                combined_output = (forward_output + torch.flip(backward_output, dims=[1])) / 2 
+
+                return self.wo(combined_output.view(seqlen_sum, self.n_heads * self.head_dim))
+     
 class FeedForward(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
